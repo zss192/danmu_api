@@ -12,7 +12,7 @@ import MangoSource from "./mango.js";
 import BilibiliSource from "./bilibili.js";
 import YoukuSource from "./youku.js";
 import BahamutSource from "./bahamut.js";
-import { titleMatches, getExplicitSeasonNumber } from "../utils/common-util.js";
+import { titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { searchBangumiData } from '../utils/bangumi-data-util.js';
 
 const tencentSource = new TencentSource();
@@ -37,9 +37,9 @@ export default class DandanSource extends BaseSource {
    */
   async search(keyword, isFallback = false) {
     if (globals.useBangumiData && !isFallback) {
-      const localMatches = searchBangumiData(keyword, ['anidb']);
+      const localMatches = await searchBangumiData(keyword, ['anidb']);
       if (localMatches.length > 0) {
-        log("info", `[Dandan] Bangumi-Data 本地命中 ${localMatches.length} 条数据`);
+        log("info", `[Dandan] Bangumi-Data 本地命中 ${localMatches.length} 条数据（检索词：${keyword}）`);
         return localMatches.map(m => {
           const displayTitle = m.titles.find(t => t && t.includes(keyword)) || m.titles[1] || m.title;
           const finalTitle = displayTitle + (m.titleSuffix || '');
@@ -51,7 +51,8 @@ export default class DandanSource extends BaseSource {
             typeDescription: m.typeStr, 
             imageUrl: "", 
             startDate: m.begin,
-            rating: 0
+            rating: 0,
+			aliases: [...m.titles]
           };
         });
       }
@@ -71,6 +72,7 @@ export default class DandanSource extends BaseSource {
               "Content-Type": "application/json",
               "User-Agent": DandanUserAgent,
             },
+			retries: 1,
           });
 
           // 判断 resp 和 resp.data 是否存在
@@ -88,12 +90,12 @@ export default class DandanSource extends BaseSource {
           // 原始搜索有结果，中断 TMDB 流程
           tmdbAbortController.abort();
           const animes = resp.data.animes;
-          log("info", `dandanSearchresp (original): ${JSON.stringify(animes)}`);
+          log("info", `[Dandan] dandanSearchresp (original): ${JSON.stringify(animes)}`);
           log("info", `[Dandan] 返回 ${animes.length} 条结果 (source: original)`);
           return { success: true, data: animes, source: 'original' };
         } catch (error) {
           // 捕获原始搜索错误，但不阻塞 TMDB 搜索
-          log("error", "getDandanAnimes error:", {
+          log("error", "[Dandan] getDandanAnimes error:", {
             message: error.message,
             name: error.name,
             stack: error.stack,
@@ -127,6 +129,7 @@ export default class DandanSource extends BaseSource {
               "User-Agent": DandanUserAgent,
             },
             signal: tmdbAbortController.signal,
+			retries: 1,
           });
 
           // 判断 resp 和 resp.data 是否存在
@@ -149,7 +152,7 @@ export default class DandanSource extends BaseSource {
             anime._tmdbCnAlias = cnAlias;
           }
 
-          log("info", `dandanSearchresp (tmdb): ${JSON.stringify(animes)}`);
+          log("info", `[Dandan] dandanSearchresp (tmdb): ${JSON.stringify(animes)}`);
           log("info", `[Dandan] 返回 ${animes.length} 条结果 (source: tmdb)`);
           return { success: true, data: animes, source: 'tmdb' };
         } catch (error) {
@@ -194,7 +197,7 @@ export default class DandanSource extends BaseSource {
       return [];
     } catch (error) {
       // 捕获请求中的错误
-      log("error", "getDandanAnimes error:", {
+      log("error", "[Dandan] getDandanAnimes error:", {
         message: error.message,
         name: error.name,
         stack: error.stack,
@@ -216,13 +219,13 @@ export default class DandanSource extends BaseSource {
 
       // 判断 resp 和 resp.data 是否存在
       if (!resp || !resp.data) {
-        log("info", "getDandanEposides: 请求失败或无数据返回");
+        log("info", "[Dandan] getDandanEposides: 请求失败或无数据返回");
         return { episodes: [], titles: [], relateds: [], type: null, typeDescription: null };
       }
 
       // 判断 bangumi 数据是否存在
       if (!resp.data.bangumi) {
-        log("info", "getDandanEposides: bangumi 数据不存在");
+        log("info", "[Dandan] getDandanEposides: bangumi 数据不存在");
         return { episodes: [], titles: [], relateds: [], type: null, typeDescription: null };
       }
 
@@ -261,14 +264,14 @@ export default class DandanSource extends BaseSource {
       const imageUrl = bangumiData.imageUrl || null;
 
       // 正常情况下输出 JSON 字符串
-      log("info", `getDandanEposides: ${JSON.stringify(resp.data.bangumi.episodes)}`);
+      log("info", `[Dandan] getDandanEposides: ${JSON.stringify(resp.data.bangumi.episodes)}`);
 
       // 返回包含剧集、别名、相关作品、类型及封面信息的完整对象
       return { episodes, titles, relateds, type, typeDescription, imageUrl };
 
     } catch (error) {
       // 捕获请求中的错误
-      log("error", "getDandanEposides error:", {
+      log("error", "[Dandan] getDandanEposides error:", {
         message: error.message,
         name: error.name,
         stack: error.stack,
@@ -287,8 +290,15 @@ export default class DandanSource extends BaseSource {
     return intersection / union;
   }
 
-  // 处理并转换番剧信息
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null) {
+  /**
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map|null} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
+   */
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
@@ -311,8 +321,30 @@ export default class DandanSource extends BaseSource {
     const existingIds = new Set();
     const queue = [];
 
-    // 初始化任务队列与去重池：将所有初始搜索结果载入队列，标记为非相关作品
-    for (const anime of sourceAnimes) {
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查初始结果中是否已包含匹配项
+    let matchedAnimes = sourceAnimes;
+    let isTargetFoundInInitial = false;
+
+    if (resolvedQuerySeason !== null) {
+      const filtered = sourceAnimes.filter(anime => {
+        const titleToCheck = anime._displayTitle || anime.animeTitle;
+        const s = extractSeasonNumberFromAnimeTitle(titleToCheck).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (filtered.length > 0) {
+        matchedAnimes = filtered;
+        isTargetFoundInInitial = true;
+        log("info", `[Dandan] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
+    // 初始化任务队列与去重池：将筛选后的条目载入队列，标记为非相关作品
+    for (const anime of matchedAnimes) {
       existingIds.add(anime.animeId);
       queue.push({ ...anime, isRelated: false });
     }
@@ -331,11 +363,14 @@ export default class DandanSource extends BaseSource {
           // 计算当前作品标题与用户原始搜索词的相似度
           const similarity = this.calculateSimilarity(queryTitle, anime.animeTitle);
 
+          // 关联挖掘控制逻辑：仅当用户未指定明确季度，或者初始扫描未命中目标季度时，才执行相关作品的深度展开
+          const canExpandRelateds = !isTargetFoundInInitial;
+
           // 相似度高于10%时，对每个关联作品单独判断是否符合展开条件：
           // 关联作品标题含季度信息（避免范围发散），或初始搜索结果不少于25个（API25个结果上限，用相关作品突破）
-          if (similarity >= 0.1 && details.relateds && Array.isArray(details.relateds)) {
+          if (similarity >= 0.1 && details.relateds && Array.isArray(details.relateds) && canExpandRelateds) {
             for (const rel of details.relateds) {
-              const hasSeason = getExplicitSeasonNumber(rel.animeTitle) !== null;
+              const hasSeason = extractSeasonNumberFromAnimeTitle(rel.animeTitle).season !== null;
               if (!existingIds.has(rel.animeId) && (hasSeason || initialCount >= 25)) {
                 existingIds.add(rel.animeId);
                 queue.push({
@@ -350,13 +385,16 @@ export default class DandanSource extends BaseSource {
           }
 
           // 区分初始搜索结果与动态相关作品的结果过滤逻辑
-          const allTitles = [anime.animeTitle, ...apiAliases];
+          const allTitles = [
+            anime.animeTitle, 
+            ...apiAliases, 
+            ...(anime.aliases || [])
+          ];
           let isMatch = false;
 
           if (anime.isRelated || anime.isTmdbSource) {
             // 相关作品及TMDB原名搜索结果逻辑：仅执行单纯的季度过滤，跳过常规标题匹配，防止标题差异导致误判
-            const querySeason = getExplicitSeasonNumber(queryTitle);
-            if (querySeason !== null) {
+            if (resolvedQuerySeason !== null) {
               let titleSeason = null;
               for (const t of allTitles) {
                 if (!t) continue;
@@ -366,9 +404,9 @@ export default class DandanSource extends BaseSource {
                   break;
                 }
               }
-              if (querySeason > 1) {
-                isMatch = (titleSeason || 1) === querySeason;
-              } else if (querySeason === 1) {
+              if (resolvedQuerySeason > 1) {
+                isMatch = (titleSeason || 1) === resolvedQuerySeason;
+              } else if (resolvedQuerySeason === 1) {
                 isMatch = titleSeason === null || titleSeason === 1;
               }
             } else {
@@ -376,7 +414,7 @@ export default class DandanSource extends BaseSource {
             }
           } else {
             // 初始数据源逻辑：执行严密的完整标题及季度双重校验
-            isMatch = allTitles.some(t => t && titleMatches(t, queryTitle));
+            isMatch = allTitles.some(t => t && titleMatches(t, queryTitle, resolvedQuerySeason));
           }
 
           // 丢弃不符合拦截策略的条目，停止后续构建流程
@@ -400,7 +438,7 @@ export default class DandanSource extends BaseSource {
             const displayTitle = anime._displayTitle || anime.animeTitle;
 
             // 合并别名池：API返回的别名 + 原始标题（供合并工具对齐使用）
-            const finalAliases = [...apiAliases];
+            const finalAliases = [...new Set([...apiAliases, ...(anime.aliases || [])])];
             if (anime.animeTitle && anime.animeTitle !== displayTitle && !finalAliases.includes(anime.animeTitle)) {
               finalAliases.push(anime.animeTitle);
             }
@@ -460,7 +498,7 @@ export default class DandanSource extends BaseSource {
           "User-Agent": DandanUserAgent,
         },
         retries: 1,
-      }).catch(e => { log('error', `dandan base comments error: ${e.message}`); return null; });
+      }).catch(e => { log('error', `[Dandan] dandan base comments error: ${e.message}`); return null; });
 
       const resp = await dandanPromise;
 
@@ -472,7 +510,7 @@ export default class DandanSource extends BaseSource {
       }
 
     } catch (error) {
-      log("error", "getEpisodeDanmu error:", {
+      log("error", "[Dandan] getEpisodeDanmu error:", {
         message: error.message,
         name: error.name,
         stack: error.stack,
@@ -483,7 +521,7 @@ export default class DandanSource extends BaseSource {
   }
 
   async getEpisodeDanmuSegments(id) {
-    log("info", "获取弹弹play弹幕分段列表...", id);
+    log("info", "[Dandan] 获取弹弹play弹幕分段列表...", id);
 
     return new SegmentListResponse({
       "type": "dandan",
